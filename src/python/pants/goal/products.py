@@ -12,6 +12,7 @@ import six
 from twitter.common.collections import OrderedSet
 
 from pants.util.dirutil import fast_relpath
+from pants.util.memo import memoized
 
 
 class ProductError(Exception):
@@ -240,7 +241,7 @@ class MultipleRootedProducts(object):
 
 
 class Products(object):
-  """An out-of-band 'dropbox' where tasks can place build product information for later tasks to use.
+  """An out-of-band 'dropbox' where tasks can place build product information for later task to use.
 
   Historically, the only type of product was a ProductMapping. However this had some issues, as not
   all products fit into the (basedir, [files-under-basedir]) paradigm. Also, ProductMapping docs
@@ -265,6 +266,11 @@ class Products(object):
 
   :API: public
   """
+
+  @classmethod
+  def product_mapping(cls, typename):
+    return cls.ProductMapping.named(typename)
+
   class ProductMapping(object):
     """Maps products of a given type by target. Each product is a map from basedir to a list of
     files in that dir.
@@ -272,11 +278,34 @@ class Products(object):
     :API: public
     """
 
-    def __init__(self, typename):
+    @staticmethod
+    @memoized
+    def named(typename):
+      """Return the ProductMapping type for the given typename.
+
+      :param string typename: The unique product mapping type name.
+      :returns: The unique :class:`ProductMapping` subtype associated with the given `typename`.
+      :rtype: :class:`Products.ProductMapping`
+      """
+      return type(b'ProductMapping({!r})'.format(typename),
+                  (Products.ProductMapping,),
+                  dict(typename=typename))
+
+    def __new__(cls, typename=None):
+      embedded_typename = getattr(cls, 'typename', typename)
+      if typename is not None and embedded_typename != typename:
+        raise ValueError('A ProductMapping type created via `named` cannot be instantiated with a '
+                         'new name.  Type {} was passed a typename of {!r}.'
+                         .format(cls.__name__, typename))
+      product_mapping_type = cls.named(embedded_typename)
+      return object.__new__(product_mapping_type)
+
+    def __init__(self, typename=None):
       """
       :API: public
       """
-      self.typename = typename
+      # NB: typename is now turned into a class attribute by __new__ but the parameter remains
+      # here for API compatibility.
       self.by_target = defaultdict(lambda: defaultdict(list))
 
     def empty(self):
@@ -360,13 +389,14 @@ class Products(object):
     __nonzero__ = __bool__
 
   def __init__(self):
-    # TODO(John Sirois): Kill products and simply have users register ProductMapping subtypes
-    # as data products.  Will require a class factory, like `ProductMapping.named(typename)`.
-    self.products = {}  # type -> ProductMapping instance.
-    self.required_products = set()
-
     self.data_products = {}  # type -> arbitrary object.
     self.required_data_products = set()
+
+  def _as_product_type(self, type_or_typename):
+    if isinstance(type_or_typename, type):
+      return type_or_typename
+    else:
+      return self.ProductMapping.named(type_or_typename)
 
   def require(self, typename):
     """Registers a requirement that file products of the given type by mapped.
@@ -375,21 +405,22 @@ class Products(object):
 
     :param typename: the type or other key of a product mapping that should be generated.
     """
-    self.required_products.add(typename)
+    self.require_data(self._as_product_type(typename))
 
   def isrequired(self, typename):
     """Checks if a particular product is required by any tasks.
 
     :API: public
     """
-    return typename in self.required_products
+    return self.is_required_data(self._as_product_type(typename))
 
   def get(self, typename):
     """Returns a ProductMapping for the given type name.
 
     :API: public
     """
-    return self.products.setdefault(typename, Products.ProductMapping(typename))
+    product_type = self._as_product_type(typename)
+    return self.get_data(product_type, init_func=product_type)
 
   def require_data(self, typename):
     """Registers a requirement that data produced by tasks is required.
@@ -416,7 +447,7 @@ class Products(object):
     return self.get_data(typename, init_func)
 
   def get_data(self, typename, init_func=None):
-    """ Returns a data product.
+    """Returns a data product.
 
     :API: public
 
